@@ -1,0 +1,271 @@
+name: build
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * 0'
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - shard: z1-9
+            minzoom: 1
+            maxzoom: 9
+            bbox: -180,-85,180,85
+          - shard: z10
+            minzoom: 10
+            maxzoom: 10
+            bbox: -180,-85,180,85
+          - shard: z11-nw
+            minzoom: 11
+            maxzoom: 11
+            bbox: -180,0,0,85
+          - shard: z11-ne
+            minzoom: 11
+            maxzoom: 11
+            bbox: 0,0,180,85
+          - shard: z11-sw
+            minzoom: 11
+            maxzoom: 11
+            bbox: -180,-85,0,0
+          - shard: z11-se
+            minzoom: 11
+            maxzoom: 11
+            bbox: 0,-85,180,0
+          - shard: z12-1
+            minzoom: 12
+            maxzoom: 12
+            bbox: -180,42.5,-90,85
+          - shard: z12-2
+            minzoom: 12
+            maxzoom: 12
+            bbox: -90,42.5,0,85
+          - shard: z12-3
+            minzoom: 12
+            maxzoom: 12
+            bbox: 0,42.5,90,85
+          - shard: z12-4
+            minzoom: 12
+            maxzoom: 12
+            bbox: 90,42.5,180,85
+          - shard: z12-5
+            minzoom: 12
+            maxzoom: 12
+            bbox: -180,0,-90,42.5
+          - shard: z12-6
+            minzoom: 12
+            maxzoom: 12
+            bbox: -90,0,0,42.5
+          - shard: z12-7
+            minzoom: 12
+            maxzoom: 12
+            bbox: 0,0,90,42.5
+          - shard: z12-8
+            minzoom: 12
+            maxzoom: 12
+            bbox: 90,0,180,42.5
+          - shard: z12-9
+            minzoom: 12
+            maxzoom: 12
+            bbox: -180,-42.5,-90,0
+          - shard: z12-10
+            minzoom: 12
+            maxzoom: 12
+            bbox: -90,-42.5,0,0
+          - shard: z12-11
+            minzoom: 12
+            maxzoom: 12
+            bbox: 0,-42.5,90,0
+          - shard: z12-12
+            minzoom: 12
+            maxzoom: 12
+            bbox: 90,-42.5,180,0
+          - shard: z12-13
+            minzoom: 12
+            maxzoom: 12
+            bbox: -180,-85,-90,-42.5
+          - shard: z12-14
+            minzoom: 12
+            maxzoom: 12
+            bbox: -90,-85,0,-42.5
+          - shard: z12-15
+            minzoom: 12
+            maxzoom: 12
+            bbox: 0,-85,90,-42.5
+          - shard: z12-16
+            minzoom: 12
+            maxzoom: 12
+            bbox: 90,-85,180,-42.5
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: hiddewie/OpenRailwayMap-vector
+          path: upstream
+      - env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          pip install awscli -q
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            aws s3 rm "s3://${R2_BUCKET}/tmp/" --recursive \
+              --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" || true
+          elif aws s3 ls "s3://${R2_BUCKET}/tmp/${{ matrix.shard }}.mbtiles" \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" 2>/dev/null; then
+            echo "SKIP_BUILD=true" >> $GITHUB_ENV
+          fi
+      - if: env.SKIP_BUILD != 'true'
+        run: docker pull ghcr.io/hiddewie/openrailwaymap-import-db:latest
+      - if: env.SKIP_BUILD != 'true'
+        run: |
+          docker run -d --name ormdb \
+            --shm-size=1g \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -e PGDATA=/data/postgresql \
+            -e POSTGRES_DB=gis \
+            -p 5432:5432 \
+            ghcr.io/hiddewie/openrailwaymap-import-db:latest
+          for i in $(seq 1 60); do
+            docker exec ormdb pg_isready -U postgres && break
+            sleep 10
+          done
+      - if: env.SKIP_BUILD != 'true'
+        run: |
+          python3 - <<'PYEOF'
+          import re, subprocess, sys
+          def psql(q):
+              r = subprocess.run(['docker','exec','ormdb','psql','-U','postgres','-d','gis','-tA','-c',q], capture_output=True, text=True)
+              return r.returncode, r.stdout, r.stderr
+          def fix_sha256(defn):
+              out, i = [], 0
+              while True:
+                  m = re.search(r'sha256\(', defn[i:])
+                  if not m: out.append(defn[i:]); break
+                  s = i + m.start(); out.append(defn[i:s])
+                  p, d, j = s + 7, 1, s + 7
+                  while d > 0:
+                      d += 1 if defn[j] == '(' else -1 if defn[j] == ')' else 0; j += 1
+                  inner = defn[p:j-1]
+                  if inner.rstrip().endswith('::bytea'):
+                      expr = inner.rstrip()[:-7].rstrip()
+                      out.append(f"sha256(convert_to({expr}, 'UTF8'))")
+                  else:
+                      out.append(defn[s:j])
+                  i = j
+              return ''.join(out)
+          rc, out, err = psql("SELECT viewname FROM pg_views WHERE schemaname='public'")
+          if rc != 0: print("LIST VIEWS FAILED:", err, file=sys.stderr); sys.exit(1)
+          n = 0
+          for name in [l.strip() for l in out.splitlines() if l.strip()]:
+              rc, vdef, err = psql(f"SELECT pg_get_viewdef('{name}', false)")
+              if rc != 0: print("GET VIEWDEF FAILED", name, err, file=sys.stderr); sys.exit(1)
+              new = fix_sha256(vdef.strip())
+              if new != vdef.strip():
+                  rc, _, err = psql(f"CREATE OR REPLACE VIEW {name} AS {new}")
+                  if rc != 0: print("FIX VIEW FAILED", name, err, file=sys.stderr); sys.exit(1)
+                  print("FIXED VIEW", name, file=sys.stderr); n += 1
+          print("FIXED", n, "VIEWS", file=sys.stderr)
+          if n == 0: print("NO sha256(::bytea) FOUND", file=sys.stderr); sys.exit(1)
+          PYEOF
+      - if: env.SKIP_BUILD != 'true'
+        run: |
+          python3 - <<'PYEOF' >> "$GITHUB_ENV"
+          import re, subprocess, sys
+          def psql(q):
+              r = subprocess.run(['docker','exec','ormdb','psql','-U','postgres','-d','gis','-tA','-c',q], capture_output=True, text=True)
+              return r.returncode, (r.stderr or r.stdout).strip().splitlines()[:1]
+          rc, err = psql("SELECT 1")
+          if rc != 0:
+              print("DB CONNECT FAILED:", err, file=sys.stderr); sys.exit(1)
+          cfg = open('upstream/martin/configuration.yml').read()
+          names = re.findall(r'^    ([a-z0-9_]+):', cfg.split('functions:')[1], re.M)
+          good, bad = [], []
+          for n in names:
+              rc, _ = psql(f"SELECT length({n}(3,4,3))")
+              if rc != 0:
+                  rc, err = psql(f"SELECT length({n}(3,4,3,'{{}}'::json))")
+              (good if rc == 0 else bad).append(n)
+              if rc != 0: print("SKIP", n, err, file=sys.stderr)
+          if not good:
+              print("ALL SOURCES FAILED", file=sys.stderr); sys.exit(1)
+          print(f"SRC={','.join(good)}")
+          PYEOF
+      - if: env.SKIP_BUILD != 'true'
+        env:
+          DATABASE_URL: postgres://postgres@127.0.0.1:5432/gis
+          POSTGRES_RELOAD_INTERVAL: 10s
+        run: |
+          curl -sL https://github.com/maplibre/martin/releases/download/martin-v1.11.0/martin-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /tmp
+          MCP=$(find /tmp -maxdepth 3 -name martin-cp -type f | head -1)
+          "$MCP" --config upstream/martin/configuration.yml \
+            --output-file /tmp/${{ matrix.shard }}.mbtiles \
+            --mbtiles-type normalized \
+            --bbox=${{ matrix.bbox }} \
+            --min-zoom ${{ matrix.minzoom }} \
+            --max-zoom ${{ matrix.maxzoom }} \
+            --concurrency 16 \
+            --source "$SRC"
+          test -s /tmp/${{ matrix.shard }}.mbtiles
+      - if: env.SKIP_BUILD != 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          pip install awscli
+          aws s3 cp /tmp/${{ matrix.shard }}.mbtiles "s3://${R2_BUCKET}/tmp/${{ matrix.shard }}.mbtiles" \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          pip install awscli
+          mkdir -p /tmp/shards
+          for s in z1-9 z10 z11-nw z11-ne z11-sw z11-se z12-1 z12-2 z12-3 z12-4 z12-5 z12-6 z12-7 z12-8 z12-9 z12-10 z12-11 z12-12 z12-13 z12-14 z12-15 z12-16; do
+            aws s3 cp "s3://${R2_BUCKET}/tmp/$s.mbtiles" /tmp/shards/$s.mbtiles \
+              --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          done
+          ls -lh /tmp/shards
+      - run: |
+          cd /tmp/shards
+          ls -lh
+          cp z1-9.mbtiles /tmp/orm.mbtiles
+          rm z1-9.mbtiles
+          for f in z10.mbtiles z11-nw.mbtiles z11-ne.mbtiles z11-sw.mbtiles z11-se.mbtiles z12-1.mbtiles z12-2.mbtiles z12-3.mbtiles z12-4.mbtiles z12-5.mbtiles z12-6.mbtiles z12-7.mbtiles z12-8.mbtiles z12-9.mbtiles z12-10.mbtiles z12-11.mbtiles z12-12.mbtiles z12-13.mbtiles z12-14.mbtiles z12-15.mbtiles z12-16.mbtiles; do
+            sqlite3 /tmp/orm.mbtiles "ATTACH DATABASE '$f' AS s; INSERT OR IGNORE INTO images SELECT * FROM s.images; INSERT OR IGNORE INTO map SELECT * FROM s.map; DETACH DATABASE s;"
+            rm "$f"
+          done
+          sqlite3 /tmp/orm.mbtiles "UPDATE metadata SET value='12' WHERE name='maxzoom';"
+          sqlite3 /tmp/orm.mbtiles "SELECT count(*) FROM tiles;"
+          ls -lh /tmp/orm.mbtiles
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: |
+          go install github.com/protomaps/go-pmtiles@latest
+          ~/go/bin/go-pmtiles convert /tmp/orm.mbtiles /tmp/orm.pmtiles
+          ls -lh /tmp/orm.pmtiles
+          test -s /tmp/orm.pmtiles
+      - env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          pip install awscli
+          aws s3 cp /tmp/orm.pmtiles "s3://${R2_BUCKET}/orm.pmtiles" \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 rm "s3://${R2_BUCKET}/tmp/" --recursive \
+            --endpoint-url "https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
